@@ -577,6 +577,18 @@ def test_regress_out_matches_per_gene_glm(*, categorical: bool) -> None:
     np.testing.assert_allclose(adata.X, expected, atol=1e-5)
 
 
+def test_regress_out_all_threads() -> None:
+    """`n_jobs=-1` means every thread, and the thread count doesn’t change the result."""
+    rng = np.random.default_rng(0)
+    adata = AnnData(rng.random((100, 20)))
+    adata.obs["batch"] = pd.Categorical(np.repeat(["a", "b"], 50))
+
+    one = sc.pp.regress_out(adata, "batch", n_jobs=1, out=True)
+    every = sc.pp.regress_out(adata, "batch", n_jobs=-1, out=True)
+
+    np.testing.assert_array_equal(one, every)
+
+
 def test_regress_out_categorical_missing() -> None:
     adata = AnnData(np.arange(6, dtype=np.float32).reshape(3, 2))
     adata.obs["batch"] = pd.Categorical(["a", None, "b"])

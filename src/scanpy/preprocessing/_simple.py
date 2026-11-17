@@ -18,15 +18,16 @@ from fast_array_utils.conv import to_dense
 from fast_array_utils.numba import njit
 from numpy._typing._array_like import NDArray
 from pandas.api.types import CategoricalDtype
-from scipy import sparse
 from scverse_misc import Deprecation, deprecated_arg
 from sklearn.utils import check_array
 
 from .. import logging as logg
 from .._compat import CSBase, CSRBase, DaskArray
 from .._docs import doc_out, doc_ref_compat, doc_rng, doc_use
+from .._settings import settings
 from .._utils import (
     _doc_params,
+    _numba_thread_limit,
     _resolve_axis,
     check_array_function_arguments,
     expose_dispatch,
@@ -554,19 +555,24 @@ def sqrt(
     return _write_out(data, x, out=out, use=use)
 
 
-def _category_means(
-    x: NDArray[np.floating], /, codes: NDArray[np.integer], n_categories: int
-) -> NDArray[np.float64]:
-    """Per-category mean of every gene, as an `(n_categories, n_genes)` matrix."""
-    if (codes < 0).any():
-        msg = "The categorical covariate has missing values."
-        raise ValueError(msg)
-    n_obs = len(codes)
-    indicator = sparse.csr_array(  # noqa: TID251
-        (np.ones(n_obs), (codes, np.arange(n_obs))), shape=(n_categories, n_obs)
-    )
-    counts = np.bincount(codes, minlength=n_categories)
-    return (indicator @ x) / np.maximum(counts, 1)[:, None]  # unused categories stay 0
+@njit
+def _subtract_category_means(
+    x: NDArray[np.float64], /, codes: NDArray[np.integer], n_categories: int
+) -> None:
+    """Subtract each gene's per-category mean from `x` in place, in parallel over genes."""
+    counts = np.zeros(n_categories, dtype=np.int64)
+    for i in range(codes.shape[0]):
+        if codes[i] < 0:
+            raise ValueError("The categorical covariate has missing values.")  # noqa: EM101
+        counts[codes[i]] += 1
+    for j in numba.prange(x.shape[1]):
+        means = np.zeros(n_categories)
+        for i in range(x.shape[0]):
+            means[codes[i]] += x[i, j]
+        for c in range(n_categories):
+            means[c] /= max(counts[c], 1)  # unused categories stay 0
+        for i in range(x.shape[0]):
+            x[i, j] -= means[codes[i]]
 
 
 @njit
@@ -641,8 +647,8 @@ def regress_out(
     {use}
     {out}
     n_jobs
-        Unused, as the regression no longer runs in parallel jobs.
-        Kept for backwards compatibility.
+        Number of threads for the computation (`-1` means all).
+        `None` means using :attr:`scanpy.settings.n_jobs`.
     copy
         Whether to return a modified copy instead of modifying `adata` in place.
     keys
@@ -704,22 +710,24 @@ def regress_out(
         regressors = covariates.to_numpy()
         normalized = _NormalizedRegressors(regressors)
 
-    # non-categorical regressors & non-singular matrix → shortcut
-    if not variable_is_categorical and np.linalg.det(normalized.gram) != 0:
-        res = normalized.regress_out(x)
-    else:  # categorical or singular: least squares for all genes at once
-        x = to_dense(x, order="C") if isinstance(x, CSBase) else x
-        res = np.array(x, dtype=np.float64)  # float64, as the per-gene GLM returned
-        if variable_is_categorical:
-            # regressing a gene on `[1, its per-category mean]` leaves exactly
-            # its deviations from that mean
-            res -= _category_means(res, cat_array, n_categories)[cat_array]
-        else:  # `lstsq` handles the singular design; the residuals are unique
-            coeff = np.linalg.lstsq(normalized.regressors, res, rcond=None)[0]
-            res -= normalized.regressors @ coeff
-        # the per-gene GLM skipped constant genes, so they keep their values
-        const = (x == x[0]).all(axis=0)
-        res[:, const] = x[:, const]
+    with _numba_thread_limit(settings.n_jobs if n_jobs is None else n_jobs):
+        # non-categorical regressors & non-singular matrix → shortcut
+        if not variable_is_categorical and np.linalg.det(normalized.gram) != 0:
+            res = normalized.regress_out(x)
+        else:  # categorical or singular: least squares for all genes at once
+            x = to_dense(x, order="F") if isinstance(x, CSBase) else x
+            # float64, as the per-gene GLM returned; one gene per column for the kernel
+            res = np.array(x, dtype=np.float64, order="F")
+            if variable_is_categorical:
+                # regressing a gene on `[1, its per-category mean]` leaves exactly
+                # its deviations from that mean
+                _subtract_category_means(res, cat_array, n_categories)
+            else:  # `lstsq` handles the singular design; the residuals are unique
+                coeff = np.linalg.lstsq(normalized.regressors, res, rcond=None)[0]
+                res -= normalized.regressors @ coeff
+            # the per-gene GLM skipped constant genes, so they keep their values
+            const = (x == x[0]).all(axis=0)
+            res[:, const] = x[:, const]
 
     logg.info("    finished", time=start)
     if (unwritten := _write_out(adata, res, out=out, use=use, layer=layer)) is not None:
