@@ -5,11 +5,9 @@ Compositions of these functions are found in sc.preprocess.recipes.
 
 from __future__ import annotations
 
-import warnings
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from functools import singledispatch
-from itertools import repeat
 from typing import TYPE_CHECKING, overload
 
 import numba
@@ -20,13 +18,13 @@ from fast_array_utils.conv import to_dense
 from fast_array_utils.numba import njit
 from numpy._typing._array_like import NDArray
 from pandas.api.types import CategoricalDtype
+from scipy import sparse
 from scverse_misc import Deprecation, deprecated_arg
 from sklearn.utils import check_array
 
 from .. import logging as logg
 from .._compat import CSBase, CSRBase, DaskArray
 from .._docs import doc_out, doc_ref_compat, doc_rng, doc_use
-from .._settings import settings
 from .._utils import (
     _doc_params,
     _resolve_axis,
@@ -55,7 +53,6 @@ if TYPE_CHECKING:
     from numbers import Number
     from typing import Literal, Self
 
-    import pandas as pd
     from numpy.typing import NDArray
 
     from .._utils.random import RNGLike, SeedLike
@@ -557,21 +554,19 @@ def sqrt(
     return _write_out(data, x, out=out, use=use)
 
 
-@njit
-def _create_regressor_categorical(
-    x: np.ndarray, /, number_categories: int, cat_array: np.ndarray
-) -> np.ndarray:
-    # create regressor matrix for categorical variables
-    # would be best to use X dtype but this matches old behavior
-    regressors = np.zeros(x.shape, dtype=np.float32)
-    # iterate over categories
-    for category in range(number_categories):
-        # iterate over genes and calculate mean expression
-        # for each gene per category
-        mask = category == cat_array
-        for ix in numba.prange(x.T.shape[0]):
-            regressors[mask, ix] = x.T[ix, mask].mean()
-    return regressors
+def _category_means(
+    x: NDArray[np.floating], /, codes: NDArray[np.integer], n_categories: int
+) -> NDArray[np.float64]:
+    """Per-category mean of every gene, as an `(n_categories, n_genes)` matrix."""
+    if (codes < 0).any():
+        msg = "The categorical covariate has missing values."
+        raise ValueError(msg)
+    n_obs = len(codes)
+    indicator = sparse.csr_array(  # noqa: TID251
+        (np.ones(n_obs), (codes, np.arange(n_obs))), shape=(n_categories, n_obs)
+    )
+    counts = np.bincount(codes, minlength=n_categories)
+    return (indicator @ x) / np.maximum(counts, 1)[:, None]  # unused categories stay 0
 
 
 @njit
@@ -646,8 +641,8 @@ def regress_out(
     {use}
     {out}
     n_jobs
-        Number of jobs for parallel computation.
-        `None` means using :attr:`scanpy.settings.n_jobs`.
+        Unused, as the regression no longer runs in parallel jobs.
+        Kept for backwards compatibility.
     copy
         Whether to return a modified copy instead of modifying `adata` in place.
     keys
@@ -659,8 +654,6 @@ def regress_out(
     By default overwrites the matrix `use` reads from (see `out` for others).
 
     """
-    from joblib import Parallel, delayed
-
     # `covariates` was positional before being renamed from `keys`, so keep its strings’ meaning
     keys = _ref_arg(
         covariates, keys, name="covariates", legacy_name="keys", compat=True
@@ -690,8 +683,6 @@ def regress_out(
     if isinstance(x, CSBase):
         logg.info("    sparse input is densified and may lead to high memory use")
 
-    n_jobs = settings.n_jobs if n_jobs is None else n_jobs
-
     # regress on a single categorical variable
     variable_is_categorical = False
     if keys and isinstance((first := covariates.iloc[:, 0]).dtype, CategoricalDtype):
@@ -703,15 +694,8 @@ def regress_out(
             )
             raise ValueError(msg)
         logg.debug("... regressing on per-gene means within categories")
-        # set number of categories to the same dtype as the categories
         cat_array = first.cat.codes.to_numpy()
-        number_categories = cat_array.dtype.type(len(first.cat.categories))
-
-        x = to_dense(x, order="F") if isinstance(x, CSBase) else x
-        if np.issubdtype(x.dtype, np.integer):
-            target_dtype = np.float32 if x.dtype.itemsize <= 4 else np.float64
-            x = x.astype(target_dtype)
-        regressors = _create_regressor_categorical(x, number_categories, cat_array)
+        n_categories = len(first.cat.categories)
         variable_is_categorical = True
     # regress on one or several ordinal variables
     else:
@@ -723,75 +707,24 @@ def regress_out(
     # non-categorical regressors & non-singular matrix → shortcut
     if not variable_is_categorical and np.linalg.det(normalized.gram) != 0:
         res = normalized.regress_out(x)
-    else:  # GLM implemetation
-        # split the adata.X matrix by columns in chunks of size n_chunk
-        # (the last chunk could be of smaller size than the others)
-        len_chunk = int(np.ceil(min(1000, x.shape[1]) / n_jobs))
-        n_chunks = int(np.ceil(x.shape[1] / len_chunk))
-        x = to_dense(x, order="F") if isinstance(x, CSBase) else x
-        chunk_list = np.array_split(x, n_chunks, axis=1)
-        regressors_chunk = (
-            np.array_split(regressors, n_chunks, axis=1)
-            if variable_is_categorical
-            else repeat(regressors)
-        )
-
-        # each task is passed a data chunk (e.g. `adata.X[:, 0:100]``) and the regressors.
-        # This data will be passed to each of the jobs.
-        # TODO: figure out how to test that this doesn't oversubscribe resources
-        res = Parallel(n_jobs=n_jobs)(
-            delayed(_regress_out_chunk)(
-                data_chunk, regres, variable_is_categorical=variable_is_categorical
-            )
-            for data_chunk, regres in zip(chunk_list, regressors_chunk, strict=False)
-        )
-
-        # res is a list of vectors (each corresponding to a regressed gene column).
-        # The transpose is needed to get the matrix in the shape needed
-        res = np.vstack(res).T
+    else:  # categorical or singular: least squares for all genes at once
+        x = to_dense(x, order="C") if isinstance(x, CSBase) else x
+        res = np.array(x, dtype=np.float64)  # float64, as the per-gene GLM returned
+        if variable_is_categorical:
+            # regressing a gene on `[1, its per-category mean]` leaves exactly
+            # its deviations from that mean
+            res -= _category_means(res, cat_array, n_categories)[cat_array]
+        else:  # `lstsq` handles the singular design; the residuals are unique
+            coeff = np.linalg.lstsq(normalized.regressors, res, rcond=None)[0]
+            res -= normalized.regressors @ coeff
+        # the per-gene GLM skipped constant genes, so they keep their values
+        const = (x == x[0]).all(axis=0)
+        res[:, const] = x[:, const]
 
     logg.info("    finished", time=start)
     if (unwritten := _write_out(adata, res, out=out, use=use, layer=layer)) is not None:
         return unwritten
     return None
-
-
-def _regress_out_chunk(
-    data_chunk: NDArray[np.floating],
-    regressors: pd.DataFrame | NDArray[np.floating],
-    *,
-    variable_is_categorical: bool,
-) -> NDArray[np.floating]:
-    import statsmodels.api as sm
-    import statsmodels.tools.sm_exceptions as sme
-
-    responses_chunk_list = []
-    for col_index in range(data_chunk.shape[1]):
-        # if all values are identical, the statsmodel.api.GLM throws an error;
-        # but then no regression is necessary anyways...
-        if not (data_chunk[:, col_index] != data_chunk[0, col_index]).any():
-            responses_chunk_list.append(data_chunk[:, col_index])
-            continue
-
-        if variable_is_categorical:
-            regres = np.c_[np.ones(regressors.shape[0]), regressors[:, col_index]]
-        else:
-            regres = regressors
-
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", sme.PerfectSeparationWarning)
-                result = sm.GLM(
-                    data_chunk[:, col_index], regres, family=sm.families.Gaussian()
-                ).fit()
-                new_column = result.resid_response
-        except (sme.PerfectSeparationError, sme.PerfectSeparationWarning):
-            logg.warning("Encountered perfect separation, setting to 0 as in R.")
-            new_column = np.zeros(data_chunk.shape[0])
-
-        responses_chunk_list.append(new_column)
-
-    return np.vstack(responses_chunk_list)
 
 
 @overload
