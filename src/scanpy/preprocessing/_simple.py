@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     from numbers import Number
     from typing import Literal, Self
 
-    import pandas as pd
     from numpy.typing import NDArray
 
     from .._utils.random import RNGLike, SeedLike
@@ -556,18 +555,6 @@ def sqrt(
     return _write_out(data, x, out=out, use=use)
 
 
-def _category_codes(col: pd.Series) -> NDArray[np.integer]:
-    """Category codes of `col`, rejecting missing values (code `-1`)."""
-    codes = col.cat.codes.to_numpy()
-    if n_missing := int((codes < 0).sum()):
-        msg = (
-            f"Categorical covariate {col.name!r} has missing values in "
-            f"{n_missing} cells. Drop those cells or give them a category."
-        )
-        raise ValueError(msg)
-    return codes
-
-
 @njit
 def _subtract_category_means(
     x: NDArray[np.float64], /, codes: NDArray[np.integer], n_categories: int
@@ -603,7 +590,7 @@ class _NormalizedRegressors:
     gram: np.ndarray = field(init=False)
 
     def __post_init__(self) -> None:
-        self.regressors = self.regressors.astype(np.float64, copy=True)
+        self.regressors = self.regressors.astype(np.float64, order="C", copy=True)
         self.regressors[:, 1:] -= self.regressors[:, 1:].mean(axis=0)
         norms = np.linalg.norm(self.regressors, axis=0)
         self.regressors /= np.where(norms > 0, norms, 1.0)
@@ -628,7 +615,7 @@ class _NormalizedRegressors:
 @deprecated_arg("layer", Deprecation("1.13.0", "Use `use`/`out` instead."))
 @deprecated_arg("keys", Deprecation("1.13.0", "Use `covariates` instead."))
 @deprecated_copy
-def regress_out(
+def regress_out(  # noqa: PLR0912
     adata: AnnData,
     covariates: AdRef | str | Sequence[AdRef | str] | None = None,
     *,
@@ -711,7 +698,13 @@ def regress_out(
             )
             raise ValueError(msg)
         logg.debug("... regressing on per-gene means within categories")
-        cat_array = _category_codes(first)
+        cat_array = first.cat.codes.to_numpy()
+        if n_missing := int((cat_array < 0).sum()):
+            msg = (
+                f"Categorical covariate {first.name!r} has missing values in "
+                f"{n_missing} cells. Drop those cells or give them a category."
+            )
+            raise ValueError(msg)
         n_categories = len(first.cat.categories)
         variable_is_categorical = True
     # regress on one or several ordinal variables
