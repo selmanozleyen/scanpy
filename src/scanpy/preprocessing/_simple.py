@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from numbers import Number
     from typing import Literal, Self
 
+    import pandas as pd
     from numpy.typing import NDArray
 
     from .._utils.random import RNGLike, SeedLike
@@ -555,6 +556,18 @@ def sqrt(
     return _write_out(data, x, out=out, use=use)
 
 
+def _category_codes(col: pd.Series) -> NDArray[np.integer]:
+    """Category codes of `col`, rejecting missing values (code `-1`)."""
+    codes = col.cat.codes.to_numpy()
+    if n_missing := int((codes < 0).sum()):
+        msg = (
+            f"Categorical covariate {col.name!r} has missing values in "
+            f"{n_missing} cells. Drop those cells or give them a category."
+        )
+        raise ValueError(msg)
+    return codes
+
+
 @njit
 def _subtract_category_means(
     x: NDArray[np.float64], /, codes: NDArray[np.integer], n_categories: int
@@ -562,8 +575,6 @@ def _subtract_category_means(
     """Subtract each gene's per-category mean from `x` in place, in parallel over genes."""
     counts = np.zeros(n_categories, dtype=np.int64)
     for i in range(codes.shape[0]):
-        if codes[i] < 0:
-            raise ValueError("The categorical covariate has missing values.")  # noqa: EM101
         counts[codes[i]] += 1
     for j in numba.prange(x.shape[1]):
         means = np.zeros(n_categories)
@@ -700,7 +711,7 @@ def regress_out(
             )
             raise ValueError(msg)
         logg.debug("... regressing on per-gene means within categories")
-        cat_array = first.cat.codes.to_numpy()
+        cat_array = _category_codes(first)
         n_categories = len(first.cat.categories)
         variable_is_categorical = True
     # regress on one or several ordinal variables

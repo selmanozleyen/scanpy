@@ -593,7 +593,7 @@ def test_regress_out_categorical_missing() -> None:
     adata = AnnData(np.arange(6, dtype=np.float32).reshape(3, 2))
     adata.obs["batch"] = pd.Categorical(["a", None, "b"])
 
-    with pytest.raises(ValueError, match=r"missing values"):
+    with pytest.raises(ValueError, match=r"'batch' has missing values in 1 cells"):
         sc.pp.regress_out(adata, "batch")
 
 
