@@ -645,7 +645,7 @@ def regress_out(  # noqa: PLR0912
     {use}
     {out}
     n_jobs
-        Number of threads for the computation (`-1` means all).
+        Number of jobs for parallel computation.
         `None` means using :attr:`scanpy.settings.n_jobs`.
     copy
         Whether to return a modified copy instead of modifying `adata` in place.
